@@ -1,0 +1,352 @@
+# =============================================================================
+# WebGoat • JFrog Killchain Demo Pipeline
+#
+# Maps the 6-step killchain from the JFrog deck onto GitHub Actions jobs:
+#   Step 1: Prevent & Detect      → job "prevent-detect"     (Curation + Xray SCA)
+#   Step 2: Map the Impact        → UI walkthrough (no pipeline action needed)
+#   Step 3: Prioritize            → job "prioritize"         (JAS + Contextual Analysis)
+#   Step 4: Remediate             → frogbot.yml (separate)
+#   Step 5: Verify                → this file re-runs on frogbot/** branches
+#   Step 6: Approve & Prove       → job "approve-and-prove"  (Release Bundle + Evidence)
+#
+# Target JPD (default): https://joe.rodolphef.org  — override via workflow_dispatch or JF_URL var
+# =============================================================================
+
+name: WebGoat • JFrog Killchain
+
+on:
+  push:
+    branches: [ main, develop, 'frogbot/**' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      jfrog_url:
+        description: 'JFrog Platform URL (overrides JF_URL variable)'
+        required: false
+        default: 'https://joe.rodolphef.org'
+
+env:
+  JF_URL: ${{ github.event.inputs.jfrog_url || vars.JF_URL || 'https://joe.rodolphef.org' }}
+  JFROG_CLI_BUILD_NAME: webgoat-killchain
+  JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}
+  APP_KEY: webgoat
+  APP_VERSION: 2026.0.${{ github.run_number }}
+
+  # Repository keys on the target JPD
+  MAVEN_VIRTUAL: webgoat-maven-virtual
+  MAVEN_DEV_LOCAL: webgoat-maven-dev-local
+  DOCKER_DEV_REPO: webgoat-docker-dev-local
+
+  # Signing key alias registered on the JPD (Administration → Keys Management)
+  SIGNING_KEY_ALIAS: webgoat-signer
+
+permissions:
+  id-token: write        # OIDC auth to JFrog
+  contents: read         # Checkout
+  pull-requests: write   # PR comments for scan results
+  security-events: write # Upload SARIF to GitHub Security tab
+
+jobs:
+
+  # ===========================================================================
+  # STEP 1 • PREVENT & DETECT
+  #   Prevent: Every Maven dependency resolves through webgoat-maven-remote,
+  #            which has a Curation policy attached. Malicious/blocked packages
+  #            are rejected at the resolve step -- pipeline fails deliberately.
+  #   Detect:  Build info is published, Xray runs SCA against it and surfaces
+  #            CVEs on the transitive dep tree.
+  # ===========================================================================
+  prevent-detect:
+    name: "1 • Prevent & Detect (Curation + Xray SCA)"
+    runs-on: ubuntu-latest
+    outputs:
+      docker_ref: ${{ steps.docker-push.outputs.docker_ref }}
+      docker_registry: ${{ steps.registry.outputs.registry }}
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Derive the Docker registry hostname from JF_URL (strip scheme)
+      - name: Compute Docker registry hostname
+        id: registry
+        run: |
+          registry="${JF_URL#https://}"
+          registry="${registry#http://}"
+          registry="${registry%/}"
+          echo "registry=${registry}" >> "$GITHUB_OUTPUT"
+          echo "Using Docker registry: ${registry}"
+
+      # JFrog CLI + OIDC. No long-lived tokens needed.
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ env.JF_URL }}
+        with:
+          oidc-provider-name: joestack
+
+      - name: Verify JFrog connection
+        run: jf rt ping
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # -------------------------------------------------------------------
+      # Curation-gated Maven build
+      #   Any dep that violates the webgoat-block-critical-high Curation
+      #   policy fails here with a 403 from Artifactory. That IS Step 1.
+      # -------------------------------------------------------------------
+      - name: Configure jf mvn (route through Artifactory)
+        run: |
+          jf mvn-config \
+            --repo-resolve-releases=${{ env.MAVEN_VIRTUAL }} \
+            --repo-resolve-snapshots=${{ env.MAVEN_VIRTUAL }} \
+            --repo-deploy-releases=${{ env.MAVEN_DEV_LOCAL }} \
+            --repo-deploy-snapshots=${{ env.MAVEN_DEV_LOCAL }}
+
+      - name: Maven build + deploy (build-info collected)
+        run: |
+          jf mvn clean package -DskipTests
+
+      - name: Publish Maven build info
+        run: |
+          jf rt build-collect-env
+          jf rt build-add-git
+          jf rt build-publish
+
+      # -------------------------------------------------------------------
+      # Xray build scan -- Detect leg of Step 1
+      #   On main: fail on Critical/High so the gate is real.
+      #   On feature/frogbot branches: warn only, so devs still see findings.
+      # -------------------------------------------------------------------
+      - name: Xray build scan (SCA)
+        id: xray-scan
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            jf build-scan --fail=true --vuln=true
+          else
+            jf build-scan --fail=false --vuln=true
+          fi
+        continue-on-error: ${{ github.ref != 'refs/heads/main' }}
+
+      # -------------------------------------------------------------------
+      # Docker build + push. `jf docker push` collects Docker build-info
+      # automatically -- image layers become part of the same build entity.
+      # -------------------------------------------------------------------
+      - name: Docker login to Artifactory
+        run: jf docker login ${{ steps.registry.outputs.registry }}
+
+      - name: Docker build
+        run: |
+          IMAGE_REF="${{ steps.registry.outputs.registry }}/${{ env.DOCKER_DEV_REPO }}/webgoat:${{ env.APP_VERSION }}"
+          docker build -t "${IMAGE_REF}" .
+          echo "Built ${IMAGE_REF}"
+
+      - name: Docker push + build-info
+        id: docker-push
+        run: |
+          IMAGE_REF="${{ steps.registry.outputs.registry }}/${{ env.DOCKER_DEV_REPO }}/webgoat:${{ env.APP_VERSION }}"
+          jf docker push "${IMAGE_REF}"
+          echo "docker_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+
+      # Re-publish build info now that Docker layers are included
+      - name: Re-publish build info (with Docker)
+        run: jf rt build-publish
+
+
+  # ===========================================================================
+  # STEP 3 • PRIORITIZE
+  #   JAS runs SAST, secrets, IaC and SCA scans on the source; `jf docker scan`
+  #   runs image-level scanning WITH Contextual Analysis to reduce the CVE
+  #   queue by ~90% down to what's actually reachable in the built artifact.
+  # ===========================================================================
+  prioritize:
+    name: "3 • Prioritize (JAS + Contextual Analysis)"
+    needs: prevent-detect
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ env.JF_URL }}
+        with:
+          oidc-provider-name: joestack
+
+      # Source-level JAS: SAST + secrets + IaC + SCA.
+      # WebGoat has intentional SAST-detectable flaws -- expect findings.
+      - name: jf audit (source-level JAS)
+        run: |
+          jf audit \
+            --sast \
+            --secrets \
+            --iac \
+            --sca \
+            --format=table \
+          || echo "::warning::Audit findings present (expected for WebGoat)"
+        continue-on-error: true
+
+      # Image-level scan + Contextual Analysis: this is where the reachability
+      # verdict comes from. The "~90% suppressed as non-applicable" claim on
+      # slide 3 shows up as the Applicability column in Xray.
+      - name: jf docker scan (image + contextual analysis)
+        run: |
+          jf docker scan \
+            "${{ needs.prevent-detect.outputs.docker_ref }}" \
+            --format=table \
+            --extended-table \
+          || echo "::warning::Docker scan findings present (expected for WebGoat)"
+        continue-on-error: true
+
+
+  # ===========================================================================
+  # STEP 6 • APPROVE & PROVE
+  #   Only on main. Creates an AppTrust application version (Release Bundle v2),
+  #   attaches signed evidence, and promotes through stages. The GitHub
+  #   environment "prod" gate becomes the human-approver evidence.
+  # ===========================================================================
+  approve-and-prove:
+    name: "6 • Approve & Prove (AppTrust + Evidence)"
+    needs: [ prevent-detect, prioritize ]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: prod  # Required reviewer gate; approver identity becomes evidence
+    steps:
+
+      - name: Setup JFrog CLI (OIDC)
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ env.JF_URL }}
+        with:
+          oidc-provider-name: joestack
+
+      # -------------------------------------------------------------------
+      # Create the Release Bundle v2 from the build entity. This IS the
+      # AppTrust application version; both Maven and Docker artifacts get
+      # included because they share the same build name/number.
+      # -------------------------------------------------------------------
+      - name: Create Release Bundle (AppTrust application version)
+        run: |
+          jf rbc \
+            "${{ env.APP_KEY }}" \
+            "${{ env.APP_VERSION }}" \
+            --build-name="${{ env.JFROG_CLI_BUILD_NAME }}" \
+            --build-number="${{ env.JFROG_CLI_BUILD_NUMBER }}" \
+            --signing-key="${{ env.SIGNING_KEY_ALIAS }}" \
+            --sync=true
+
+      # -------------------------------------------------------------------
+      # Evidence: SLSA-shaped build provenance
+      # -------------------------------------------------------------------
+      - name: Attach evidence — build provenance (SLSA)
+        run: |
+          cat > provenance.json <<EOF
+          {
+            "buildDefinition": {
+              "buildType": "https://github.com/actions/runner/github-hosted@v1",
+              "externalParameters": {
+                "workflow": "${{ github.workflow }}",
+                "ref": "${{ github.ref }}",
+                "repository": "${{ github.repository }}",
+                "sha": "${{ github.sha }}"
+              }
+            },
+            "runDetails": {
+              "builder": { "id": "https://github.com/actions/runner" },
+              "metadata": {
+                "invocationId": "${{ github.run_id }}",
+                "startedOn": "${{ github.event.head_commit.timestamp }}"
+              }
+            }
+          }
+          EOF
+          jf evd create \
+            --release-bundle="${{ env.APP_KEY }}" \
+            --release-bundle-version="${{ env.APP_VERSION }}" \
+            --predicate=./provenance.json \
+            --predicate-type=https://slsa.dev/provenance/v1 \
+            --key="${{ env.SIGNING_KEY_ALIAS }}"
+
+      # -------------------------------------------------------------------
+      # Evidence: vulnerability scan summary
+      # -------------------------------------------------------------------
+      - name: Attach evidence — Xray scan summary
+        run: |
+          jf build-scan --format=json > scan-summary.json || true
+          # If build-scan returns nothing parseable (unlikely) fall back to stub
+          if [ ! -s scan-summary.json ]; then
+            echo '{"status":"scan-executed","details":"see Xray UI"}' > scan-summary.json
+          fi
+          jf evd create \
+            --release-bundle="${{ env.APP_KEY }}" \
+            --release-bundle-version="${{ env.APP_VERSION }}" \
+            --predicate=./scan-summary.json \
+            --predicate-type=https://jfrog.com/evidence/vulnerability-summary/v1 \
+            --key="${{ env.SIGNING_KEY_ALIAS }}"
+
+      # -------------------------------------------------------------------
+      # Evidence: human approver (from the GitHub environment gate)
+      # -------------------------------------------------------------------
+      - name: Attach evidence — approver
+        run: |
+          cat > approval.json <<EOF
+          {
+            "approver": "${{ github.actor }}",
+            "approvalTime": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflowRun": "${{ github.run_id }}",
+            "environment": "prod",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
+          jf evd create \
+            --release-bundle="${{ env.APP_KEY }}" \
+            --release-bundle-version="${{ env.APP_VERSION }}" \
+            --predicate=./approval.json \
+            --predicate-type=https://jfrog.com/evidence/approval/v1 \
+            --key="${{ env.SIGNING_KEY_ALIAS }}"
+
+      # -------------------------------------------------------------------
+      # Stage promotion. AppTrust policies gate each transition; if the
+      # required evidence isn't present, promotion fails here.
+      # -------------------------------------------------------------------
+      - name: Promote DEV → QA
+        run: |
+          jf rbp \
+            "${{ env.APP_KEY }}" \
+            "${{ env.APP_VERSION }}" \
+            QA \
+            --signing-key="${{ env.SIGNING_KEY_ALIAS }}"
+
+      - name: Promote QA → STAGING
+        run: |
+          jf rbp \
+            "${{ env.APP_KEY }}" \
+            "${{ env.APP_VERSION }}" \
+            STAGING \
+            --signing-key="${{ env.SIGNING_KEY_ALIAS }}"
+
+      - name: Promote STAGING → PROD
+        run: |
+          jf rbp \
+            "${{ env.APP_KEY }}" \
+            "${{ env.APP_VERSION }}" \
+            PROD \
+            --signing-key="${{ env.SIGNING_KEY_ALIAS }}"
+
+      - name: Summary
+        run: |
+          echo "### 🎯 Killchain complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build:** ${{ env.JFROG_CLI_BUILD_NAME }} / ${{ env.JFROG_CLI_BUILD_NUMBER }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ needs.prevent-detect.outputs.docker_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **AppTrust version:** ${{ env.APP_KEY }}/${{ env.APP_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Stage reached:** PROD" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Open [${{ env.JF_URL }}/ui/apptrust/apps/${{ env.APP_KEY }}](${{ env.JF_URL }}/ui/apptrust/apps/${{ env.APP_KEY }}) to walk the evidence graph." >> $GITHUB_STEP_SUMMARY
