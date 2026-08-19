@@ -1,46 +1,50 @@
 # =============================================================================
 # Frogbot repo config for the WebGoat killchain demo
 # Doc: https://docs.jfrog.com/jfrog-applications/frogbot/setup-frogbot/frogbot-configuration
+#
+# NOTE: top level must be a YAML list (Frogbot's RepoAggregator type) — each
+# item is one repo's `params:` block. A bare `params:` map at the top level
+# fails with "cannot unmarshal !!map into utils.RepoAggregator".
 # =============================================================================
 
-params:
-  git:
-    repoName: WebGoat
-    branches:
-      - main
-    # Frogbot's fix PRs will land as frogbot/<something> branches; that pattern
-    # is what killchain.yml watches on `push` to re-scan and provide Step 5 Verify.
-    pullRequestCommentReminder: true
-    aggregateFixes: true              # one PR per group instead of one-per-CVE
-    branchNameTemplate: "frogbot/${IMPACTED_PACKAGE}_${FIX_VERSION}"
+- params:
+    git:
+      repoName: WebGoat
+      branches:
+        - main
+      # Frogbot's fix PRs will land as frogbot/<something> branches; that pattern
+      # is what killchain.yml watches on `push` to re-scan and provide Step 5 Verify.
+      pullRequestCommentReminder: true
+      aggregateFixes: true              # one PR per group instead of one-per-CVE
+      branchNameTemplate: "frogbot/${IMPACTED_PACKAGE}_${FIX_VERSION}"
 
-  scan:
-    # Full JAS + SCA on every scan
-    includeAllVulnerabilities: false  # only show applicable ones (Contextual Analysis)
-    failOnSecurityIssues: true        # fail the PR check if unresolved
+    scan:
+      # Full JAS + SCA on every scan
+      includeAllVulnerabilities: false  # only show applicable ones (Contextual Analysis)
+      failOnSecurityIssues: true        # fail the PR check if unresolved
 
-    # Toggle each JAS scanner. WebGoat has plenty of SAST-worthy code and
-    # some hardcoded dev secrets -- both light up nicely for the demo.
-    sast:
-      enabled: true
-    secrets:
-      enabled: true
-    iac:
-      enabled: false                  # WebGoat has no meaningful IaC
-    applications:
-      enabled: true                   # applicability / contextual analysis
+      # Toggle each JAS scanner. WebGoat has plenty of SAST-worthy code and
+      # some hardcoded dev secrets -- both light up nicely for the demo.
+      sast:
+        enabled: true
+      secrets:
+        enabled: true
+      iac:
+        enabled: false                  # WebGoat has no meaningful IaC
+      applications:
+        enabled: true                   # applicability / contextual analysis
 
-    # WebGoat is Maven multi-module. One entry per module you want scanned.
-    projects:
-      - workingDirs:
-          - "."
-        installCommand: "mvn dependency:resolve -q -DskipTests"
-        useWrapper: false
+      # WebGoat is Maven multi-module. One entry per module you want scanned.
+      projects:
+        - workingDirs:
+            - "."
+          installCommand: "mvn dependency:resolve -q -DskipTests"
+          useWrapper: false
 
-  jfrogPlatform:
-    # The Curation-gated virtual repo that Frogbot's fix-candidate lookups
-    # will resolve against. Any bumped fix version is pre-validated by
-    # Curation before the PR is opened.
-    jfrogProjectKey: ""              # set if you're using a JFrog Project
-    watches:
-      - webgoat-build-watch          # the Xray watch configured in §3.3 of README
+    jfrogPlatform:
+      # The Curation-gated virtual repo that Frogbot's fix-candidate lookups
+      # will resolve against. Any bumped fix version is pre-validated by
+      # Curation before the PR is opened.
+      jfrogProjectKey: ""              # set if you're using a JFrog Project
+      watches:
+        - webgoat-build-watch          # the Xray watch configured in §3.3 of README
