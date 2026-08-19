@@ -17,8 +17,11 @@ name: WebGoat • JFrog Killchain
 on:
   push:
     branches: [ main, develop, 'frogbot/**' ]
-  pull_request:
-    branches: [ main ]
+  # No pull_request trigger: the OIDC identity mapping is scoped to
+  # ref=refs/heads/main, which a pull_request event's token never carries
+  # (it's refs/pull/<N>/merge) -- PR-triggered runs would always 403 on
+  # the OIDC exchange. PR-time scanning is already covered by Frogbot's
+  # own scan-pull-request job (frogbot.yml).
   workflow_dispatch:
     inputs:
       jfrog_url:
